@@ -12,7 +12,7 @@ function draw() {
   rect(width - s, height - s, s, s);
   textSize(72);
   textAlign("center");
-  text("ZANG YUYAN", width / 2, height / 2);
+  text("Zang Yuyan", width / 2, height / 2);
 }
 
 function windowResized() {
