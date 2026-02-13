@@ -1,26 +1,30 @@
-let C = [];
+// ====== 资源 ======
+let C_raw = []; // 原图（桌面用）
+let C_mobile = []; // 手机缓存缩放图（手机用）
 const TOTAL = 11;
 
-// ===== 设备倾斜 =====
 let tiltGamma = 0;
 let hasDeviceTilt = false;
 
-// ===== 当前娃娃（静态可交互）=====
 let doll = null;
-
-// ===== 裂开下落动画对象（一次只播一个）=====
 let crackFall = null;
 
-// ===== 参数 =====
+// ====== 平台判断：只在手机/平板启用优化 ======
+const IS_MOBILE = (() => {
+  const ua = navigator.userAgent || "";
+  const touch = "ontouchstart" in window || navigator.maxTouchPoints > 0;
+  return /Android|iPhone|iPad|iPod|Mobile/i.test(ua) || touch;
+})();
+
+// ====== 参数 ======
 const FIT_RATIO = 0.62;
 
-// 不倒翁物理（弹簧 + 阻尼 + 回正）
-const INPUT_TORQUE = 0.22; // 输入推力矩（越大越跟手）
-const RESTORE_K = 0.085; // 回正力度（越大越像不倒翁）
-const DAMPING = 0.86; // 阻尼（越小晃得越久）
-const MAX_ANGLE = 24; // 最大倾斜角
-
-const IDLE_SWAY_SPEED = 0.03; // 微摆动
+// 不倒翁物理
+const INPUT_TORQUE = 0.22;
+const RESTORE_K = 0.085;
+const DAMPING = 0.86;
+const MAX_ANGLE = 24;
+const IDLE_SWAY_SPEED = 0.03;
 const IDLE_SWAY_AMP = 1.6;
 
 // 缩小（差距不要太大）
@@ -32,19 +36,29 @@ const CRACK_OPEN_FRAMES = 10;
 const FALL_FADE_FRAMES = 60;
 const GRAVITY = 0.55;
 
-// 防交叉：最小水平间距（随尺寸变化）
-const MIN_GAP_RATIO = 0.06; // gap = imgWidth*scale*MIN_GAP_RATIO
+// 防交叉
+const MIN_GAP_RATIO = 0.06;
 
 function preload() {
   for (let i = 1; i <= TOTAL; i++) {
-    C.push(loadImage(`assets/C/C${i}.png`));
+    C_raw.push(loadImage(`assets/C/C${i}.png`));
   }
 }
 
 function setup() {
+  // ✅ 关键：只在手机端限制像素密度，桌面不动
+  if (IS_MOBILE) {
+    const dpr = window.devicePixelRatio || 1;
+    // 更流畅：1；更清晰但仍比默认轻：2
+    pixelDensity(Math.min(2, dpr));
+  }
+
   createCanvas(windowWidth, windowHeight);
   imageMode(CENTER);
   angleMode(DEGREES);
+
+  // ✅ 只在手机端做缓存缩放，桌面不动
+  if (IS_MOBILE) buildMobileCache();
 
   spawnRandomDoll(1.0);
   setupDeviceOrientation();
@@ -52,6 +66,7 @@ function setup() {
 
 function windowResized() {
   resizeCanvas(windowWidth, windowHeight);
+  if (IS_MOBILE) buildMobileCache();
   if (doll) doll.setPosition(width / 2, height / 2);
   if (crackFall) crackFall.setBase(width / 2, height / 2);
 }
@@ -61,14 +76,11 @@ function draw() {
 
   const input = getInputValue();
 
-  // 播裂开下落动画
   if (crackFall) {
     crackFall.update();
     crackFall.render();
-
     if (crackFall.done) {
-      // 动画结束：出现更小的同款娃娃
-      const img = crackFall.img;
+      const img = crackFall.img; // 已经是当前平台的图
       const nextScale = computeNextScale(img, crackFall.nextScaleBase);
       doll = new RolyDoll(img, width / 2, height / 2, nextScale);
       crackFall = null;
@@ -76,26 +88,27 @@ function draw() {
     return;
   }
 
-  // 正常显示娃娃
   if (doll) {
     doll.update(input);
     doll.render();
   }
 }
 
-// ===== 输入：倾斜优先，否则鼠标 =====
-function getInputValue() {
-  if (hasDeviceTilt) return constrain(tiltGamma / 35, -1, 1);
-  const v = (mouseX - width / 2) / (width / 2);
-  return constrain(v, -1, 1);
+// ====== 触控更稳定（手机端建议加）=====
+function touchStarted() {
+  requestIOSPermissionIfNeeded();
+  // 让触控等价于鼠标点击逻辑
+  if (touches && touches.length > 0) {
+    const t = touches[0];
+    handlePress(t.x, t.y);
+  }
+  return false;
 }
-
-// ===== 交互 =====
-// 点空白：生成新随机娃娃（正常尺寸）
-// 点娃娃：裂开->下落消失->出现更小同款娃娃（可无限变小）
 function mousePressed() {
   requestIOSPermissionIfNeeded();
-
+  handlePress(mouseX, mouseY);
+}
+function handlePress(px, py) {
   if (crackFall) return;
 
   if (!doll) {
@@ -103,18 +116,56 @@ function mousePressed() {
     return;
   }
 
-  if (doll.hitTest(mouseX, mouseY)) {
+  if (doll.hitTest(px, py)) {
     triggerCrackAndShrink();
   } else {
     spawnRandomDoll(1.0);
   }
 }
 
-// ===== 生成随机娃娃 =====
+// ====== 输入：倾斜优先，否则鼠标 ======
+function getInputValue() {
+  if (hasDeviceTilt) return constrain(tiltGamma / 35, -1, 1);
+  const v = (mouseX - width / 2) / (width / 2);
+  return constrain(v, -1, 1);
+}
+
+// ====== 选择当前平台要用的图 ======
+function getAssetList() {
+  // 手机端优先用缓存缩放图；如果缓存尚未完成就用原图兜底
+  if (IS_MOBILE && C_mobile.length === TOTAL) return C_mobile;
+  return C_raw;
+}
+
+// ====== 手机端缓存缩放：降低每帧绘制负载（桌面不做）=====
+function buildMobileCache() {
+  C_mobile = [];
+
+  // 目标：让图片最大边接近屏幕尺寸（不需要比屏幕更大）
+  const targetMax = Math.max(width, height) * (pixelDensity() || 1) * 0.95;
+
+  for (let i = 0; i < C_raw.length; i++) {
+    const src = C_raw[i];
+
+    const scale = Math.min(1, targetMax / Math.max(src.width, src.height));
+    const w = Math.max(1, Math.floor(src.width * scale));
+    const h = Math.max(1, Math.floor(src.height * scale));
+
+    // 复制再 resize，避免改坏原图（桌面要用）
+    const img = src.get();
+    img.resize(w, h);
+    C_mobile.push(img);
+  }
+}
+
+// ====== 生成随机娃娃 ======
 function spawnRandomDoll(scale = 1.0) {
-  const img = random(C);
+  const list = getAssetList();
+  const img = random(list);
+
   const fit = getFitScale(img, FIT_RATIO);
   const finalScale = scale * fit;
+
   doll = new RolyDoll(img, width / 2, height / 2, finalScale);
 }
 
@@ -124,7 +175,7 @@ function getFitScale(img, ratio) {
   return min(maxW / img.width, maxH / img.height);
 }
 
-// ===== 计算下一次缩放（温和缩小 + 下限）=====
+// ====== 计算下一次缩放（温和缩小 + 下限）=====
 function computeNextScale(img, currentScale) {
   const fit = getFitScale(img, FIT_RATIO);
   const minScale = fit * MIN_SCALE_ABS;
@@ -135,10 +186,9 @@ function computeNextScale(img, currentScale) {
 }
 
 function triggerCrackAndShrink() {
-  const img = doll.img;
+  const img = doll.img; // 当前平台图（桌面原图 / 手机缓存图）
   const currentScale = doll.scale;
 
-  // 把当前娃娃交给裂开动画
   crackFall = new CrackFall(
     img,
     width / 2,
@@ -150,7 +200,7 @@ function triggerCrackAndShrink() {
 }
 
 // =====================
-// 类：不倒翁娃娃（弹簧/阻尼）
+// 类：不倒翁娃娃
 // =====================
 class RolyDoll {
   constructor(img, x, y, scale) {
@@ -174,7 +224,6 @@ class RolyDoll {
 
     const torqueInput = (target - this.angle) * INPUT_TORQUE;
     const torqueRestore = -this.angle * RESTORE_K;
-
     const angAcc = torqueInput + torqueRestore;
 
     this.angVel += angAcc;
@@ -191,7 +240,6 @@ class RolyDoll {
     const w = this.img.width * this.scale;
     const h = this.img.height * this.scale;
 
-    // 底部支点
     const pivotY = h * 0.2;
     const sway = sin(this.t * IDLE_SWAY_SPEED) * IDLE_SWAY_AMP;
 
@@ -216,8 +264,7 @@ class RolyDoll {
 }
 
 // =====================
-// 类：裂开 + 下落 + 渐隐（不交叉版本）
-// 用同一张图切成左右两半
+// 类：裂开 + 下落 + 渐隐（不交叉）
 // =====================
 class CrackFall {
   constructor(img, x, y, scale, nextScaleBase) {
@@ -227,11 +274,10 @@ class CrackFall {
     this.scale = scale;
     this.nextScaleBase = nextScaleBase;
 
-    this.phase = 0; // 0裂开 1下落
+    this.phase = 0;
     this.frame = 0;
     this.done = false;
 
-    // 强制：左半永远向左外翻（rot/rv 负），右半向右外翻（正）
     this.left = {
       x: x,
       y: y,
@@ -264,25 +310,18 @@ class CrackFall {
 
   update() {
     this.frame++;
-
-    // gap：随尺寸变化，保证左右不交叉
     const gap = this.img.width * this.scale * MIN_GAP_RATIO;
 
     if (this.phase === 0) {
-      // 裂开阶段：严格按 baseX 对称向外分离，不可能交叉
       const t = constrain(this.frame / CRACK_OPEN_FRAMES, 0, 1);
       const open = easeOutCubic(t);
 
       const sep = open * (this.img.width * this.scale * 0.12);
-
-      // 强制分离：左在 baseX - sep，右在 baseX + sep
       this.left.x = this.baseX - sep;
       this.right.x = this.baseX + sep;
 
-      // 再加一次硬约束（理论不会触发，但更安全）
       this.enforceNoCross(gap);
 
-      // 轻微上弹
       const lift = (1 - open) * (this.img.height * this.scale * 0.02);
       this.left.y = this.baseY - lift;
       this.right.y = this.baseY - lift;
@@ -291,7 +330,6 @@ class CrackFall {
         this.phase = 1;
         this.frame = 0;
 
-        // 进入下落：速度方向固定向外（防交叉）
         this.left.vx = -random(1.4, 2.8);
         this.right.vx = random(1.4, 2.8);
         this.left.vy = random(-2.2, -0.6);
@@ -300,7 +338,6 @@ class CrackFall {
       return;
     }
 
-    // 下落阶段：重力 + 阻尼
     this.left.vy += GRAVITY;
     this.right.vy += GRAVITY;
 
@@ -319,27 +356,21 @@ class CrackFall {
     this.left.rv *= 0.985;
     this.right.rv *= 0.985;
 
-    // ⭐关键：每一帧强制不交叉（位置+速度一起修正）
     this.enforceNoCross(gap);
 
-    if (this.frame >= FALL_FADE_FRAMES) {
-      this.done = true;
-    }
+    if (this.frame >= FALL_FADE_FRAMES) this.done = true;
   }
 
   enforceNoCross(gap) {
-    // 若 left.x 追上/超过 right.x - gap，就把它们推开
     const overlap = this.left.x + gap - this.right.x;
     if (overlap >= 0) {
-      const push = overlap / 2 + 0.5; // +0.5 防抖
+      const push = overlap / 2 + 0.5;
       this.left.x -= push;
       this.right.x += push;
 
-      // 同时修正速度：左更向左，右更向右
       this.left.vx = min(this.left.vx, -0.3);
       this.right.vx = max(this.right.vx, 0.3);
 
-      // 旋转方向再锁一次，避免视觉“翻回来”造成像交叉
       this.left.rot = min(this.left.rot, -0.5);
       this.right.rot = max(this.right.rot, 0.5);
       this.left.rv = min(this.left.rv, -0.2);
@@ -353,8 +384,7 @@ class CrackFall {
 
     let alpha = 255;
     if (this.phase === 1) {
-      alpha = map(this.frame, 0, FALL_FADE_FRAMES, 255, 0);
-      alpha = constrain(alpha, 0, 255);
+      alpha = constrain(map(this.frame, 0, FALL_FADE_FRAMES, 255, 0), 0, 255);
     }
 
     const sw = this.img.width / 2;
@@ -363,14 +393,12 @@ class CrackFall {
     push();
     tint(255, alpha);
 
-    // 左半
     push();
     translate(this.left.x, this.left.y);
     rotate(this.left.rot);
     image(this.img, 0, 0, w / 2, h, 0, 0, sw, sh);
     pop();
 
-    // 右半
     push();
     translate(this.right.x, this.right.y);
     rotate(this.right.rot);
@@ -386,7 +414,7 @@ function easeOutCubic(t) {
   return 1 - pow(1 - t, 3);
 }
 
-// ===== 设备倾斜 =====
+// ====== 设备倾斜 ======
 function setupDeviceOrientation() {
   if (!window.DeviceOrientationEvent) return;
   window.addEventListener("deviceorientation", (e) => {
